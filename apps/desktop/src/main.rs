@@ -6,8 +6,10 @@
 
 use clap::Parser;
 use core_contracts::InboundMessage;
+use feishu_provider::reply::ReplyClient;
 use feishu_provider::ws::{FeishuWsConfig, self};
-use tracing::{info, error};
+use std::sync::Arc;
+use tracing::{info, error, warn};
 use vscode_bridge::{actions, BridgeBinding};
 
 #[derive(Parser)]
@@ -40,6 +42,11 @@ async fn main() {
 
     let bridge = BridgeBinding::new(&cli.workspace, "desktop-workspace");
 
+    let reply_client = Arc::new(
+        ReplyClient::new(&cli.app_id, &cli.app_secret, &cli.domain)
+            .expect("failed to create reply client"),
+    );
+
     info!(workspace = %cli.workspace, "Starting HarborBeacon Desktop Agent");
 
     let mut handle = match ws::start(config).await {
@@ -54,9 +61,20 @@ async fn main() {
 
     while let Some(msg) = handle.message_rx.recv().await {
         info!(sender = %msg.sender_id, text = %msg.text, "Received message");
-        let reply = dispatch(&bridge, &msg);
-        // In the future this sends back via Feishu API; for now just log.
-        info!(reply = %reply, "Action result");
+        let reply_text = dispatch(&bridge, &msg);
+        info!(reply = %reply_text, "Action result");
+
+        // Send reply back to Feishu
+        if !msg.message_id.is_empty() {
+            let client = Arc::clone(&reply_client);
+            let mid = msg.message_id.clone();
+            let rt = reply_text.clone();
+            tokio::spawn(async move {
+                if let Err(e) = client.reply_text(&mid, &rt).await {
+                    warn!(error = %e, "Failed to send reply to Feishu");
+                }
+            });
+        }
     }
 
     info!("Message channel closed, exiting.");

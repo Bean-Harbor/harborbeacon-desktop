@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use thiserror::Error;
 
+pub mod reply;
 pub mod ws;
 
 #[derive(Debug, Error)]
