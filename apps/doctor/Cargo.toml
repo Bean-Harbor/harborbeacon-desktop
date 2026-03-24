@@ -1,0 +1,9 @@
+[package]
+name = "harborbeacon-desktop-doctor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true
+feishu-provider = { path = "../../crates/feishu-provider" }

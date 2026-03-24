@@ -1,0 +1,6 @@
+[package]
+name = "harborbeacon-desktop-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,7 @@
+[package]
+name = "core-contracts"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true

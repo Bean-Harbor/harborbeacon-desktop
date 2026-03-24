@@ -1,0 +1,6 @@
+[package]
+name = "harborbeacon-desktop-mcp-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

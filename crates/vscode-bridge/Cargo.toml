@@ -1,0 +1,7 @@
+[package]
+name = "vscode-bridge"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+core-contracts = { path = "../core-contracts" }
