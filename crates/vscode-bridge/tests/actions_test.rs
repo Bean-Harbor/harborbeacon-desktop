@@ -1,6 +1,7 @@
 //! Integration tests for vscode-bridge safe workspace actions.
 
 use std::fs;
+use std::process::Command;
 use tempfile::TempDir;
 use vscode_bridge::{actions, BridgeBinding};
 
@@ -21,6 +22,28 @@ fn setup() -> (TempDir, BridgeBinding) {
         root.to_str().unwrap().to_string(),
         "test-workspace".to_string(),
     );
+    (tmp, bridge)
+}
+
+fn setup_git_repo() -> (TempDir, BridgeBinding) {
+    let (tmp, bridge) = setup();
+    let root = tmp.path();
+
+    let status = Command::new("git")
+        .arg("init")
+        .current_dir(root)
+        .status()
+        .expect("git init should run");
+    assert!(status.success());
+
+    let status = Command::new("git")
+        .arg("add")
+        .arg(".")
+        .current_dir(root)
+        .status()
+        .expect("git add should run");
+    assert!(status.success());
+
     (tmp, bridge)
 }
 
@@ -108,6 +131,53 @@ fn search_text_in_subdir() {
     let result = actions::search_text(&bridge, "src", "println").unwrap();
     assert!(result.success);
     assert!(result.content.contains("println"));
+}
+
+// ---- git_diff ----
+
+#[test]
+fn git_diff_detects_modified_file() {
+    let (tmp, bridge) = setup_git_repo();
+    let root = tmp.path();
+
+    fs::write(root.join("hello.txt"), "hello world\nchanged line\n").unwrap();
+    let result = actions::git_diff(&bridge, ".").unwrap();
+    assert!(result.success);
+    assert!(result.content.contains("diff --git"));
+    assert!(result.content.contains("hello.txt"));
+}
+
+// ---- apply_patch ----
+
+#[test]
+fn apply_patch_updates_file() {
+    let (_tmp, bridge) = setup_git_repo();
+    let patch = "diff --git a/hello.txt b/hello.txt\n--- a/hello.txt\n+++ b/hello.txt\n@@ -1,2 +1,2 @@\n hello world\n-line two\n+line three\n";
+
+    let result = actions::apply_patch(&bridge, patch).unwrap();
+    assert!(result.success);
+
+    let updated = actions::read_file(&bridge, "hello.txt").unwrap();
+    assert!(updated.content.contains("line three"));
+}
+
+#[test]
+fn apply_patch_rejects_path_escape() {
+    let (_tmp, bridge) = setup_git_repo();
+    let patch = "diff --git a/../evil.txt b/../evil.txt\n--- a/../evil.txt\n+++ b/../evil.txt\n@@ -0,0 +1 @@\n+boom\n";
+
+    let result = actions::apply_patch(&bridge, patch);
+    assert!(result.is_err());
+}
+
+// ---- run_tests ----
+
+#[test]
+fn run_tests_returns_failure_for_non_cargo_workspace() {
+    let (_tmp, bridge) = setup();
+    let result = actions::run_tests(&bridge, "").unwrap();
+    assert!(!result.success);
+    assert!(result.content.contains("could not find `Cargo.toml`") || result.content.contains("could not find Cargo.toml"));
 }
 
 // ---- sandbox escape ----

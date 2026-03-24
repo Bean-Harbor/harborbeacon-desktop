@@ -102,7 +102,37 @@ fn dispatch(bridge: &BridgeBinding, msg: &InboundMessage) -> String {
             Ok(r) => r.content,
             Err(e) => format!("Error: {e}"),
         }
+    } else if let Some(path) = text.strip_prefix("/diff") {
+        let target = path.trim();
+        let target = if target.is_empty() { "." } else { target };
+        match actions::git_diff(bridge, target) {
+            Ok(r) => r.content,
+            Err(e) => format!("Error: {e}"),
+        }
+    } else if let Some(patch) = text.strip_prefix("/patch ") {
+        match actions::apply_patch(bridge, patch) {
+            Ok(r) => {
+                if r.success {
+                    r.content
+                } else {
+                    format!("Patch rejected: {}", r.content)
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
+    } else if let Some(filter) = text.strip_prefix("/test") {
+        let filter = filter.trim();
+        match actions::run_tests(bridge, filter) {
+            Ok(r) => {
+                if r.success {
+                    format!("Tests passed.\n{}", r.content)
+                } else {
+                    format!("Tests failed.\n{}", r.content)
+                }
+            }
+            Err(e) => format!("Error: {e}"),
+        }
     } else {
-        format!("Commands: /read <path> | /ls <path> | /search <path> <query>")
+        format!("Commands: /read <path> | /ls <path> | /search <path> <query> | /diff [path] | /patch <unified_patch> | /test [filter]")
     }
 }

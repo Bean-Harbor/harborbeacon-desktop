@@ -89,6 +89,37 @@ fn tool_list() -> Value {
                     },
                     "required": ["path", "query"]
                 }
+            },
+            {
+                "name": "git_diff",
+                "description": "Show git diff for a workspace path or the whole workspace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path (default: .)." }
+                    }
+                }
+            },
+            {
+                "name": "apply_patch",
+                "description": "Apply a unified patch inside the workspace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "patch": { "type": "string", "description": "Unified diff patch content." }
+                    },
+                    "required": ["patch"]
+                }
+            },
+            {
+                "name": "run_tests",
+                "description": "Run Cargo tests in the workspace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "filter": { "type": "string", "description": "Optional test filter." }
+                    }
+                }
             }
         ]
     })
@@ -111,6 +142,18 @@ fn handle_tool_call(bridge: &BridgeBinding, params: &Value) -> Value {
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
             actions::search_text(bridge, path, query)
+        }
+        "git_diff" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            actions::git_diff(bridge, path)
+        }
+        "apply_patch" => {
+            let patch = args.get("patch").and_then(Value::as_str).unwrap_or("");
+            actions::apply_patch(bridge, patch)
+        }
+        "run_tests" => {
+            let filter = args.get("filter").and_then(Value::as_str).unwrap_or("");
+            actions::run_tests(bridge, filter)
         }
         _ => {
             return json!({
