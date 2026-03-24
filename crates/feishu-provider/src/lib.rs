@@ -4,6 +4,8 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use thiserror::Error;
 
+pub mod ws;
+
 #[derive(Debug, Error)]
 pub enum FeishuError {
     #[error("http client init failed: {0}")]
