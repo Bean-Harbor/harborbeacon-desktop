@@ -12,17 +12,17 @@ This workspace currently provides:
 
 ## Layout
 
-- `apps/desktop`: future desktop host entrypoint
+- `apps/desktop`: Desktop agent — Feishu WS → dispatch → vscode-bridge → reply
 - `apps/doctor`: Feishu diagnostics CLI
-- `apps/mcp-server`: future local MCP server entrypoint
-- `crates/core-contracts`: shared types and contracts
-- `crates/feishu-provider`: Feishu API and transport helpers
-- `crates/router-runtime`: future planning and routing runtime
-- `crates/vscode-bridge`: future workspace bridge layer
+- `apps/mcp-server`: stdio MCP server for VS Code / Copilot
+- `crates/core-contracts`: shared types (Channel, InboundMessage, OutboundMessage, etc.)
+- `crates/feishu-provider`: Feishu API, WebSocket long-connection, reply client
+- `crates/router-runtime`: runtime configuration
+- `crates/vscode-bridge`: sandboxed workspace actions (read_file, list_directory, search_text)
 
 ## Quick Start
 
-Run the doctor CLI from this workspace root:
+### Doctor CLI
 
 ```powershell
 cargo run -p harborbeacon-desktop-doctor -- --app-id <APP_ID> --app-secret <APP_SECRET>
@@ -30,8 +30,37 @@ cargo run -p harborbeacon-desktop-doctor -- --app-id <APP_ID> --app-secret <APP_
 
 Use `--json` for machine-readable output.
 
-## Standalone Repository
+### Desktop Agent
 
-This folder is intended to become its own Git repository and GitHub project.
+```powershell
+cargo run -p harborbeacon-desktop -- \
+  --app-id <APP_ID> --app-secret <APP_SECRET> \
+  --workspace .
+```
 
-See `REPO_BOOTSTRAP.md` for the suggested repository split, remote naming, and first-push steps.
+The agent connects to Feishu via WebSocket, receives messages, dispatches
+`/read`, `/ls`, `/search` commands against the workspace, and replies
+back to Feishu automatically.
+
+### VS Code / Copilot MCP Integration
+
+1. Build the MCP server:
+
+   ```powershell
+   cargo build --release -p harborbeacon-desktop-mcp-server
+   ```
+
+2. Copy `.vscode/mcp.json` into your target workspace's `.vscode/` folder
+   (or merge the `"mcp"` section into your existing VS Code settings).
+
+3. Update the `"command"` path to point to the built binary, and
+   `"--workspace"` to the project root you want to expose.
+
+4. Restart VS Code. The MCP tools (`read_file`, `list_directory`,
+   `search_text`) will appear in Copilot's tool list.
+
+## Tests
+
+```powershell
+cargo test --workspace
+```
