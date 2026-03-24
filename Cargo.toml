@@ -6,6 +6,7 @@ members = [
     "crates/core-contracts",
     "crates/feishu-provider",
     "crates/router-runtime",
+    "crates/session-store",
     "crates/vscode-bridge",
 ]
 resolver = "2"

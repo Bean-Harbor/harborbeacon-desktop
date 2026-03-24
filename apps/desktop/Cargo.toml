@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 core-contracts = { path = "../../crates/core-contracts" }
 feishu-provider = { path = "../../crates/feishu-provider" }
+session-store = { path = "../../crates/session-store" }
 vscode-bridge = { path = "../../crates/vscode-bridge" }
 clap.workspace = true
 serde_json.workspace = true
