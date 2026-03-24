@@ -363,6 +363,16 @@ dependencies = [
 [[package]]
 name = "harborbeacon-desktop-app"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "core-contracts",
+ "feishu-provider",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "vscode-bridge",
+]
 
 [[package]]
 name = "harborbeacon-desktop-doctor"
