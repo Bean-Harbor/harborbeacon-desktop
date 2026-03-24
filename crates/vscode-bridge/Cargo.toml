@@ -5,3 +5,6 @@ edition.workspace = true
 
 [dependencies]
 core-contracts = { path = "../core-contracts" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
