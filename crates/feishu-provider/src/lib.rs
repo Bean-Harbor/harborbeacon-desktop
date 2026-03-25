@@ -137,25 +137,44 @@ fn fetch_ws_endpoint(
     app_secret: &str,
     domain: &str,
 ) -> Result<(String, String), FeishuError> {
-    let url = format!("{}/open-apis/callback/ws/endpoint", domain.trim_end_matches('/'));
+    let url = format!("{}/callback/ws/endpoint", domain.trim_end_matches('/'));
     let body = json!({
-        "app_id": app_id,
-        "app_secret": app_secret,
+        "AppID": app_id,
+        "AppSecret": app_secret,
     });
-    let payload = post_json(client, &url, &body)?;
+    let response = client
+        .post(&url)
+        .header("locale", "zh")
+        .json(&body)
+        .send()
+        .map_err(|error| FeishuError::Request(error.to_string()))?;
+    let raw = response
+        .text()
+        .map_err(|error| FeishuError::Json(error.to_string()))?;
+    let payload: Value = serde_json::from_str(&raw)
+        .map_err(|error| FeishuError::Json(error.to_string()))?;
     parse_success(&payload)?;
 
     let data = payload.get("data").cloned().unwrap_or(Value::Null);
     let endpoint = data
-        .get("endpoint")
+        .get("URL")
+        .or_else(|| data.get("url"))
+        .or_else(|| data.get("endpoint"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or(FeishuError::MissingField("data.endpoint"))?;
+        .ok_or(FeishuError::MissingField("data.URL"))?;
     let service_id = data
         .get("service_id")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or(FeishuError::MissingField("data.service_id"))?;
+        .or_else(|| {
+            endpoint
+                .split("service_id=")
+                .nth(1)
+                .and_then(|part| part.split('&').next())
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
 
     Ok((endpoint, service_id))
 }

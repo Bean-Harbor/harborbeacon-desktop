@@ -13,3 +13,5 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+candle-core = { git = "https://github.com/huggingface/candle", package = "candle-core" }
+candle-nn = { git = "https://github.com/huggingface/candle", package = "candle-nn" }

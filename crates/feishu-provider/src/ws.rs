@@ -6,6 +6,7 @@
 
 use core_contracts::{Channel, ChatType, ConnectionState, InboundMessage};
 use futures_util::{SinkExt, StreamExt};
+use prost::Message as ProstMessage;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,48 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{error, info, warn};
 
 use crate::FeishuError;
+
+#[derive(Clone, PartialEq, ProstMessage)]
+struct PbHeader {
+    #[prost(string, tag = "1")]
+    key: String,
+    #[prost(string, tag = "2")]
+    value: String,
+}
+
+#[derive(Clone, PartialEq, ProstMessage)]
+struct PbFrame {
+    #[prost(uint64, tag = "1")]
+    seq_id: u64,
+    #[prost(uint64, tag = "2")]
+    log_id: u64,
+    #[prost(int32, tag = "3")]
+    service: i32,
+    #[prost(int32, tag = "4")]
+    method: i32,
+    #[prost(message, repeated, tag = "5")]
+    headers: Vec<PbHeader>,
+    #[prost(string, tag = "6")]
+    payload_encoding: String,
+    #[prost(string, tag = "7")]
+    payload_type: String,
+    #[prost(bytes = "vec", tag = "8")]
+    payload: Vec<u8>,
+    #[prost(string, tag = "9")]
+    log_id_new: String,
+}
+
+impl PbFrame {
+    fn header(&self, key: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|h| h.key == key)
+            .map(|h| h.value.as_str())
+    }
+}
+
+const METHOD_CONTROL: i32 = 0;
+const METHOD_DATA: i32 = 1;
 
 /// Configuration for the Feishu WebSocket long-connection.
 #[derive(Debug, Clone)]
@@ -157,18 +200,21 @@ async fn obtain_ws_url(config: &FeishuWsConfig) -> Result<String, FeishuError> {
     }
 
     // Step 2: WS endpoint
-    let ws_url_api = format!("{domain}/open-apis/callback/ws/endpoint");
-    let ws_resp: Value = client
+    let ws_url_api = format!("{domain}/callback/ws/endpoint");
+    let ws_resp_text = client
         .post(&ws_url_api)
+        .header("locale", "zh")
         .json(&serde_json::json!({
-            "app_id": config.app_id,
-            "app_secret": config.app_secret,
+            "AppID": config.app_id,
+            "AppSecret": config.app_secret,
         }))
         .send()
         .await
         .map_err(|e| FeishuError::Request(e.to_string()))?
-        .json()
+        .text()
         .await
+        .map_err(|e| FeishuError::Json(e.to_string()))?;
+    let ws_resp: Value = serde_json::from_str(&ws_resp_text)
         .map_err(|e| FeishuError::Json(e.to_string()))?;
 
     let code = ws_resp.get("code").and_then(Value::as_i64).unwrap_or(-1);
@@ -182,10 +228,12 @@ async fn obtain_ws_url(config: &FeishuWsConfig) -> Result<String, FeishuError> {
     }
 
     ws_resp
-        .pointer("/data/endpoint")
+        .pointer("/data/URL")
+        .or_else(|| ws_resp.pointer("/data/url"))
+        .or_else(|| ws_resp.pointer("/data/endpoint"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or(FeishuError::MissingField("data.endpoint"))
+        .ok_or(FeishuError::MissingField("data.URL"))
 }
 
 /// Connect to the WS URL, receive events, and dispatch them.
@@ -207,10 +255,50 @@ async fn connect_and_receive(
             frame = read.next() => {
                 match frame {
                     Some(Ok(WsMessage::Text(text))) => {
-                        if let Some(msg) = parse_event(&text) {
+                        if let Some(msg) = parse_event_json(&text) {
                             if msg_tx.send(msg).await.is_err() {
                                 // Receiver dropped
                                 break;
+                            }
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(data))) => {
+                        match PbFrame::decode(data.as_ref()) {
+                            Ok(frame) => {
+                                let frame_type = frame.header("type").unwrap_or("");
+                                if frame.method == METHOD_CONTROL && frame_type == "ping" {
+                                    let mut pong = frame.clone();
+                                    pong.headers = vec![PbHeader {
+                                        key: "type".to_string(),
+                                        value: "pong".to_string(),
+                                    }];
+                                    pong.payload.clear();
+                                    let mut buf = Vec::new();
+                                    if pong.encode(&mut buf).is_ok() {
+                                        let _ = write.send(WsMessage::Binary(buf.into())).await;
+                                    }
+                                }
+
+                                if frame.method == METHOD_DATA && frame_type == "event" {
+                                    // ACK event frame so Feishu treats delivery as successful.
+                                    let mut ack = frame.clone();
+                                    ack.payload = br#"{"code":200}"#.to_vec();
+                                    let mut ack_buf = Vec::new();
+                                    if ack.encode(&mut ack_buf).is_ok() {
+                                        let _ = write.send(WsMessage::Binary(ack_buf.into())).await;
+                                    }
+
+                                    if let Ok(payload_text) = String::from_utf8(frame.payload.clone()) {
+                                        if let Some(msg) = parse_event_json(&payload_text) {
+                                            if msg_tx.send(msg).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to decode protobuf WS frame");
                             }
                         }
                     }
@@ -242,7 +330,7 @@ async fn connect_and_receive(
 ///
 /// Feishu sends JSON frames with a `header` and `event` section.
 /// We extract the user message from `im.message.receive_v1` events.
-fn parse_event(raw: &str) -> Option<InboundMessage> {
+fn parse_event_json(raw: &str) -> Option<InboundMessage> {
     let v: Value = serde_json::from_str(raw).ok()?;
 
     // Feishu frames have a `header.event_type` field.
@@ -332,7 +420,7 @@ mod tests {
             }
         }"#;
 
-        let msg = parse_event(frame).expect("should parse");
+        let msg = parse_event_json(frame).expect("should parse");
         assert_eq!(msg.sender_id, "ou_abc123");
         assert_eq!(msg.text, "hello world");
         assert_eq!(msg.chat_type, ChatType::P2p);
@@ -342,6 +430,6 @@ mod tests {
     #[test]
     fn ignore_non_message_event() {
         let frame = r#"{"header":{"event_type":"url_verification"}}"#;
-        assert!(parse_event(frame).is_none());
+        assert!(parse_event_json(frame).is_none());
     }
 }
