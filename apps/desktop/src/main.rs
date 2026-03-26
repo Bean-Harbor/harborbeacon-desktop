@@ -13,6 +13,8 @@ use candle_nn::ops::softmax;
 use core_contracts::InboundMessage;
 use feishu_provider::reply::ReplyClient;
 use feishu_provider::ws::{self, FeishuWsConfig};
+use reqwest::Client as HttpClient;
+use rusqlite::Connection as SqliteConn;
 use session_store::{default_session_dir, now_secs, SessionMode, SessionStore};
 use std::fs;
 use std::sync::Arc;
@@ -33,6 +35,13 @@ enum Intent {
     Status,
     SetPlan { description: String, steps: Vec<String> },
     SwitchMode(SessionMode),
+    SessionList,
+    SessionSave(Option<String>),
+    SessionLoad(String),
+    // Copilot Chat bridge
+    CopilotAsk(String),
+    CopilotSessions,
+    CopilotHistory(usize),
     Clear,
     Help,
 }
@@ -51,6 +60,9 @@ struct Cli {
     /// Session storage directory (default: {workspace}/.harborbeacon/sessions)
     #[arg(long)]
     session_dir: Option<String>,
+    /// GitHub personal access token for Copilot Chat API (or set HARBOR_GITHUB_TOKEN)
+    #[arg(long, env = "HARBOR_GITHUB_TOKEN")]
+    github_token: Option<String>,
 }
 
 #[tokio::main]
@@ -73,6 +85,8 @@ async fn main() {
 
     info!(workspace = %cli.workspace, session_dir = %session_dir, "Starting HarborBeacon Desktop Agent");
 
+    let http = HttpClient::new();
+
     let mut handle = match ws::start(config).await {
         Ok(h) => h,
         Err(e) => {
@@ -85,7 +99,7 @@ async fn main() {
 
     while let Some(msg) = handle.message_rx.recv().await {
         info!(sender = %msg.sender_id, text = %msg.text, "Received message");
-        let reply_text = dispatch_with_session(&bridge, &store, &msg);
+        let reply_text = dispatch_with_session(&bridge, &store, &msg, &http, cli.github_token.as_deref()).await;
         info!(reply = %reply_text, "Action result");
 
         if !msg.message_id.is_empty() {
@@ -105,7 +119,7 @@ async fn main() {
 
 // ---- session-aware dispatch -------------------------------------------- 
 
-fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg: &InboundMessage) -> String {
+async fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg: &InboundMessage, http: &HttpClient, github_token: Option<&str>) -> String {
     let text = msg.text.trim();
     let mut session = store.load(&msg.sender_id);
 
@@ -122,6 +136,9 @@ fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg: &Inb
                     session.last_result = Some(result.clone());
                     session.updated_at = now_secs();
                     let rem = session.pending_steps.len();
+                    if rem == 0 {
+                        let _ = store.save_snapshot(&session, Some("auto-completed"));
+                    }
                     format!(
                         "▸ 执行步骤: {step}\n\n{result}\n\n{}",
                         if rem == 0 {
@@ -146,6 +163,9 @@ fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg: &Inb
             },
             Intent::Status => fmt_session_status(&session),
             Intent::SetPlan { description, steps } => {
+                if has_meaningful_session(&session) {
+                    let _ = store.save_snapshot(&session, Some("auto-before-new-plan"));
+                }
                 session.mode = SessionMode::Planning;
                 session.current_task = Some(description.clone());
                 session.pending_steps = steps.clone();
@@ -158,9 +178,52 @@ fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg: &Inb
                 session.updated_at = now_secs();
                 format!("✅ 已切换到{label}模式")
             }
+            Intent::SessionList => match store.list_snapshots(&msg.sender_id) {
+                Ok(items) => fmt_snapshot_list(&items),
+                Err(e) => format!("读取会话历史失败: {e}"),
+            },
+            Intent::SessionSave(label) => {
+                session.updated_at = now_secs();
+                match store.save_snapshot(&session, label.as_deref()) {
+                    Ok(id) => format!("✅ 会话已保存: {id}\n发送“会话列表”可查看历史。"),
+                    Err(e) => format!("保存会话失败: {e}"),
+                }
+            }
+            Intent::SessionLoad(id) => match store.load_snapshot(&msg.sender_id, &id) {
+                Ok(mut loaded) => {
+                    loaded.updated_at = now_secs();
+                    session = loaded;
+                    format!("✅ 已载入会话: {id}\n{}", fmt_session_status(&session))
+                }
+                Err(e) => format!("载入会话失败: {e}"),
+            },
             Intent::Clear => {
+                if has_meaningful_session(&session) {
+                    let _ = store.save_snapshot(&session, Some("auto-before-clear"));
+                }
                 store.clear(&msg.sender_id);
-                return "🗑 会话已清除".to_string();
+                return "🗑 会话已清除（已自动归档）".to_string();
+            }
+            // ---------- copilot bridge ----------
+            Intent::CopilotAsk(question) => match copilot_ask(http, github_token, &question).await {
+                Ok(ans) => ans,
+                Err(e) => format!("❌ Copilot 请求失败: {e}"),
+            },
+            Intent::CopilotSessions => {
+                let sessions = read_vscode_chat_sessions();
+                fmt_vscode_sessions(&sessions)
+            }
+            Intent::CopilotHistory(n) => {
+                let sessions = read_vscode_chat_sessions();
+                if n == 0 {
+                    let msgs = read_vscode_recent_messages();
+                    fmt_recent_messages(&msgs)
+                } else if let Some(s) = sessions.get(n.saturating_sub(1)) {
+                    let msgs = read_vscode_recent_messages();
+                    format!("📝 会话: {}\n\n{}", s.title, fmt_recent_messages(&msgs))
+                } else {
+                    format!("未找到会话 #{n}，发送\"chat 历史\"查看完整列表。")
+                }
             }
             Intent::Help => help_text(),
             // ---------- action ----------
@@ -406,6 +469,23 @@ fn parse_intent(text: &str) -> Option<Intent> {
     if matches!(lower.as_str(), "状态" | "status" | "进展" | "现在做什么" | "当前任务") {
         return Some(Intent::Status);
     }
+    // meta: session history
+    if matches!(lower.as_str(), "会话列表" | "session list" | "sessions" | "历史会话" | "查看会话") {
+        return Some(Intent::SessionList);
+    }
+    for prefix in ["载入会话 ", "恢复会话 ", "session load ", "/session load ", "切换会话 "] {
+        if let Some(id) = text.strip_prefix(prefix) {
+            return Some(Intent::SessionLoad(id.trim().to_string()));
+        }
+    }
+    if matches!(lower.as_str(), "保存会话" | "session save" | "/session save") {
+        return Some(Intent::SessionSave(None));
+    }
+    for prefix in ["保存会话 ", "session save ", "/session save "] {
+        if let Some(label) = text.strip_prefix(prefix) {
+            return Some(Intent::SessionSave(Some(label.trim().to_string())));
+        }
+    }
     // meta: clear
     if matches!(lower.as_str(), "清除" | "clear" | "清除会话" | "reset" | "重置") {
         return Some(Intent::Clear);
@@ -445,6 +525,25 @@ fn parse_intent(text: &str) -> Option<Intent> {
 
     if let Some(action) = parse_action_intent(text) {
         return Some(action);
+    }
+    // Copilot Chat bridge
+    for prefix in &["问:", "ai:", "copilot:", "问copilot:", "ask:"] {
+        if let Some(q) = text.strip_prefix(prefix) {
+            return Some(Intent::CopilotAsk(q.trim().to_string()));
+        }
+    }
+    if matches!(lower.as_str(), "chat 历史" | "ai 历史" | "copilot 历史" | "聊天历史" | "chat history" | "copilot sessions") {
+        return Some(Intent::CopilotSessions);
+    }
+    for prefix in &["chat 历史 ", "copilot 历史 ", "chat history "] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            if let Ok(n) = rest.trim().parse::<usize>() {
+                return Some(Intent::CopilotHistory(n));
+            }
+        }
+    }
+    if matches!(lower.as_str(), "最近对话" | "最近消息" | "recent chat" | "查看最近对话") {
+        return Some(Intent::CopilotHistory(0));
     }
     if let Some((description, steps)) = auto_plan_from_request(text) {
         return Some(Intent::SetPlan { description, steps });
@@ -783,6 +882,36 @@ fn strip_list_prefix(s: &str) -> Option<&str> {
 
 // ---- session formatting ------------------------------------------------
 
+fn has_meaningful_session(session: &session_store::UserSession) -> bool {
+    session.current_task.is_some()
+        || !session.pending_steps.is_empty()
+        || session.last_action.is_some()
+        || session.last_result.is_some()
+}
+
+fn fmt_snapshot_list(items: &[session_store::SessionSnapshotMeta]) -> String {
+    if items.is_empty() {
+        return "暂无历史会话。发送“保存会话 <名称>”可保存当前进度。".to_string();
+    }
+
+    let mut lines = Vec::new();
+    lines.push(format!("🗂 历史会话（{}）", items.len()));
+    for (i, item) in items.iter().take(20).enumerate() {
+        let task = item.current_task.as_deref().unwrap_or("（无任务）");
+        let label = item.label.as_deref().unwrap_or("manual");
+        lines.push(format!(
+            "{}. {} | {} | 待办:{} | id:{}",
+            i + 1,
+            task,
+            label,
+            item.pending_steps,
+            item.id
+        ));
+    }
+    lines.push("发送“载入会话 <id>”恢复并继续。".to_string());
+    lines.join("\n")
+}
+
 fn fmt_session_status(session: &session_store::UserSession) -> String {
     let mode_label = match session.mode {
         SessionMode::Coding => "编码",
@@ -817,28 +946,398 @@ fn fmt_plan_saved(description: &str, steps: &[String]) -> String {
 }
 
 fn help_text() -> String {
-    "HarborBeacon 飞书远程编程指令:\n\
-\n【执行命令】\n\
+    "HarborBeacon 可用命令如下:\n\
+\n【🤖 Copilot 对话】\n\
+问: <问题>           直接向 Copilot 提问\n\
+chat 历史            查看 VS Code Copilot 会话\n\
+chat 历史 <n>        查看第 n 个会话的提问摘要\n\
+最近对话             查看最近 10 条提问\n\
+\n【代码操作】\n\
 read <path>          读取文件\n\
 ls <path>            列出目录\n\
 search <path> <q>    搜索文本\n\
 diff [path]          查看 git diff\n\
 /patch <patch>       应用补丁\n\
 test [filter]        运行测试\n\
-（也支持自然语言：如“读取文件 README.md”）\n\
+（也支持自然语言：如\"读取文件 README.md\"）\n\
 \n【会话命令】\n\
 plan <任务>          记录任务（换行写步骤）\n\
 继续                 执行下一步\n\
 重试                 重新执行上次操作\n\
 状态                 查看当前任务进展\n\
-清除                 清除会话\n\
+会话列表             查看历史会话\n\
+保存会话 [名称]      保存当前会话快照\n\
+载入会话 <id>        恢复历史会话并继续\n\
+清除                 清除会话（自动归档）\n\
 切换编码/切换规划     切换工作模式"
         .to_string()
 }
 
+// ---- Copilot Chat Bridge -----------------------------------------------
+
+struct VscodeChatSession {
+    id: String,
+    title: String,
+    last_message_date: u64,
+}
+
+/// Scan all VS Code workspaceStorage databases for Copilot Chat sessions.
+fn read_vscode_chat_sessions() -> Vec<VscodeChatSession> {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let ws_root = std::path::Path::new(&appdata)
+        .join("Code")
+        .join("User")
+        .join("workspaceStorage");
+    if !ws_root.exists() {
+        return vec![];
+    }
+    let mut all: Vec<VscodeChatSession> = vec![];
+    let Ok(entries) = std::fs::read_dir(&ws_root) else { return vec![] };
+    for entry in entries.flatten() {
+        let db_path = entry.path().join("state.vscdb");
+        if !db_path.exists() { continue; }
+        let Ok(conn) = SqliteConn::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { continue };
+        let Ok(json_str): rusqlite::Result<String> = conn.query_row(
+            "SELECT value FROM ItemTable WHERE key = 'chat.ChatSessionStore.index'",
+            [], |row| row.get(0),
+        ) else { continue };
+        let Ok(data): Result<serde_json::Value, _> = serde_json::from_str(&json_str) else { continue };
+        if let Some(map) = data["entries"].as_object() {
+            for (id, meta) in map {
+                let title = meta["title"].as_str().unwrap_or("(no title)").to_string();
+                let ts = meta["lastMessageDate"].as_u64().unwrap_or(0);
+                all.push(VscodeChatSession { id: id.clone(), title, last_message_date: ts });
+            }
+        }
+    }
+    all.sort_by(|a, b| b.last_message_date.cmp(&a.last_message_date));
+    all
+}
+
+/// Read recent user-typed prompts from the most recent VS Code Copilot Chat interactive session.
+fn read_vscode_recent_messages() -> Vec<String> {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let ws_root = std::path::Path::new(&appdata)
+        .join("Code")
+        .join("User")
+        .join("workspaceStorage");
+    if !ws_root.exists() { return vec![]; }
+
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf)> = vec![];
+    if let Ok(entries) = std::fs::read_dir(&ws_root) {
+        for entry in entries.flatten() {
+            let db_path = entry.path().join("state.vscdb");
+            if let Ok(meta) = std::fs::metadata(&db_path) {
+                if let Ok(mt) = meta.modified() {
+                    candidates.push((mt, db_path));
+                }
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+
+    for (_, db_path) in candidates.iter().take(5) {
+        let Ok(conn) = SqliteConn::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { continue };
+        let Ok(json_str): rusqlite::Result<String> = conn.query_row(
+            "SELECT value FROM ItemTable WHERE key = 'memento/interactive-session'",
+            [], |row| row.get(0),
+        ) else { continue };
+        let Ok(data): Result<serde_json::Value, _> = serde_json::from_str(&json_str) else { continue };
+        let msgs: Vec<String> = data["history"]["copilot"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|item| item["inputText"].as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        if !msgs.is_empty() { return msgs; }
+    }
+    vec![]
+}
+
+/// Try to resolve a usable GitHub OAuth token (explicit arg → gh CLI).
+fn resolve_github_token(explicit: Option<&str>) -> Result<String, String> {
+    if let Some(t) = explicit {
+        if !t.is_empty() { return Ok(t.to_string()); }
+    }
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .map_err(|e| format!("gh CLI 未找到: {e}\n请设置 HARBOR_GITHUB_TOKEN 环境变量"))?;
+    if output.status.success() {
+        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !token.is_empty() { return Ok(token); }
+    }
+    Err("无法获取 GitHub 令牌。\n请设置 HARBOR_GITHUB_TOKEN 环境变量或通过 gh auth login 登录。".to_string())
+}
+
+/// Exchange a GitHub OAuth token for a short-lived Copilot API token.
+async fn get_copilot_access_token(http: &HttpClient, github_token: &str) -> Result<String, String> {
+    // GitHub side can behave differently for PAT/OAuth tokens.
+    // Try the common combinations before failing.
+    let attempts = [
+        ("https://api.github.com/copilot_internal/v2/token", format!("Bearer {github_token}")),
+        ("https://api.github.com/copilot_internal/v2/token", format!("token {github_token}")),
+        ("https://api.github.com/copilot_internal/token", format!("Bearer {github_token}")),
+        ("https://api.github.com/copilot_internal/token", format!("token {github_token}")),
+    ];
+
+    let mut last_err = String::new();
+    for (url, auth_value) in attempts {
+        let resp = match http
+            .get(url)
+            .header("Authorization", auth_value)
+            .header("Accept", "application/json")
+            .header("User-Agent", "GitHubCopilotChat/0.15.0")
+            .header("editor-version", "vscode/1.87.0")
+            .header("editor-plugin-version", "copilot-chat/0.15.0")
+            .send()
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = format!("令牌请求失败: {e}");
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            last_err = format!("令牌接口返回 {status}: {body}");
+            continue;
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        if let Some(token) = json["token"].as_str() {
+            return Ok(token.to_string());
+        }
+        last_err = format!("令牌响应缺少 token 字段: {json}");
+    }
+
+    if last_err.contains("404") || last_err.contains("Not Found") {
+        return Err(
+            "GitHub Copilot token endpoint 返回 404。\n\
+这通常表示当前账号/环境不支持通过 REST 路径获取 Copilot 会话令牌。\n\
+建议：\n\
+1) 在本机安装并登录 GitHub Copilot CLI，然后改用 CLI 方式提问；\n\
+2) 或继续使用『chat 历史 / 最近对话』功能（不依赖该令牌接口）。"
+                .to_string(),
+        );
+    }
+
+    Err(last_err)
+}
+
+async fn copilot_ask_via_rest(http: &HttpClient, github_token: Option<&str>, question: &str) -> Result<String, String> {
+    let gh_token = resolve_github_token(github_token)?;
+    let copilot_token = get_copilot_access_token(http, &gh_token).await?;
+
+    let body = serde_json::json!({
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": "You are GitHub Copilot, an AI programming assistant. Answer concisely and helpfully. Respond in the same language as the user's question."},
+            {"role": "user", "content": question}
+        ],
+        "stream": false,
+        "max_tokens": 2048
+    });
+
+    let resp = http
+        .post("https://api.githubcopilot.com/chat/completions")
+        .header("Authorization", format!("Bearer {copilot_token}"))
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "HarborBeacon/0.1")
+        .header("editor-version", "vscode/1.87.0")
+        .header("editor-plugin-version", "copilot-chat/0.15.0")
+        .header("Copilot-Integration-Id", "copilot-chat")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Completions 请求失败: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        return Err(format!("Copilot API 返回 {status}: {body_text}"));
+    }
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    json["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("响应格式异常: {json}"))
+}
+
+fn copilot_ask_via_gh_cli(question: &str, github_token: Option<&str>) -> Result<String, String> {
+    let mut errors: Vec<String> = Vec::new();
+    let mut direct_checked = false;
+
+    // Fail fast if gh auth is unavailable to avoid interactive login flows.
+    if let Ok(status) = std::process::Command::new("gh").args(["auth", "status"]).output() {
+        if !status.status.success() {
+            return Err("GitHub CLI 未登录，请先执行 gh auth login 后重试。".to_string());
+        }
+    }
+
+    // 1) Prefer direct CLI binary if installed by MSI.
+    if let Ok(localapp) = std::env::var("LOCALAPPDATA") {
+        let direct = std::path::Path::new(&localapp)
+            .join("GitHubCopilotCLI")
+            .join("copilot.exe");
+        if direct.exists() {
+            direct_checked = true;
+            let mut cmd = std::process::Command::new(&direct);
+            cmd.args(["-p", question])
+                .env("GH_PROMPT_DISABLED", "1")
+                .env("COPILOT_CLI_TELEMETRY_OPTOUT", "1");
+            if let Some(t) = github_token {
+                cmd.env("GH_TOKEN", t).env("GITHUB_TOKEN", t);
+            }
+
+            match cmd.output() {
+                Ok(output) => {
+                    if output.status.success() {
+                        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !text.is_empty() {
+                            return Ok(text);
+                        }
+                        return Err("Copilot CLI 未返回内容，请检查 GitHub 账号登录状态。".to_string());
+                    }
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let merged = if !stderr.is_empty() { stderr } else { stdout };
+                    if merged.contains("auth login") || merged.contains("authenticate") || merged.contains("not logged") {
+                        return Err("Copilot CLI 需要 GitHub 登录，请先执行 gh auth login 后重试。".to_string());
+                    }
+                    if !merged.is_empty() {
+                        return Err(format!("Copilot CLI 调用失败: {merged}"));
+                    }
+                    return Err("Copilot CLI 调用失败（无错误输出）".to_string());
+                }
+                Err(e) => return Err(format!("无法调用 Copilot CLI: {e}")),
+            }
+        }
+    }
+
+    // If direct executable exists, never fall through to gh wrapper to avoid interactive hangs.
+    if direct_checked {
+        return Err("Copilot CLI 未能返回结果。".to_string());
+    }
+
+    // 2) Fallback to gh wrapper.
+    let mut gh_cmd = std::process::Command::new("gh");
+    gh_cmd
+        .args(["copilot", "-p", question])
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("COPILOT_CLI_TELEMETRY_OPTOUT", "1");
+    if let Some(t) = github_token {
+        gh_cmd.env("GH_TOKEN", t).env("GITHUB_TOKEN", t);
+    }
+
+    match gh_cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !text.is_empty() {
+                    return Ok(text);
+                }
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let merged = if !stderr.is_empty() { stderr } else { stdout };
+
+            if merged.contains("Cannot find GitHub Copilot CLI") {
+                return Err(
+                    "REST 路径不可用，且本机未安装 GitHub Copilot CLI。\n\
+请先安装 Copilot CLI（或执行 gh copilot 并选择安装），然后重试『问: ...』。"
+                        .to_string(),
+                );
+            }
+
+            if merged.contains("not logged") || merged.contains("auth") || merged.contains("login") {
+                return Err("gh copilot 未登录，请先执行 gh auth login 后重试。".to_string());
+            }
+
+            if !merged.is_empty() {
+                errors.push(format!("gh copilot: {merged}"));
+            }
+        }
+        Err(e) => errors.push(format!("无法调用 gh copilot: {e}")),
+    }
+
+    if errors.is_empty() {
+        Err("CLI 回退失败（无输出）".to_string())
+    } else {
+        Err(format!("CLI 回退失败: {}", errors.join(" | ")))
+    }
+}
+
+/// Ask a question to GitHub Copilot and return the response text.
+async fn copilot_ask(http: &HttpClient, github_token: Option<&str>, question: &str) -> Result<String, String> {
+    let gh_token = resolve_github_token(github_token).ok();
+
+    let rest_result = if let Some(ref t) = gh_token {
+        copilot_ask_via_rest(http, Some(t.as_str()), question).await
+    } else {
+        Err("未能获取 GitHub token，跳过 REST 路径。".to_string())
+    };
+
+    match rest_result {
+        Ok(ans) => Ok(ans),
+        Err(rest_err) => {
+            // Fallback to command-line Copilot when REST endpoint is unavailable.
+            match copilot_ask_via_gh_cli(question, gh_token.as_deref()) {
+                Ok(ans) => Ok(ans),
+                Err(cli_err) => Err(format!("REST 失败: {rest_err}\n\nCLI 回退失败: {cli_err}")),
+            }
+        }
+    }
+}
+
+fn fmt_vscode_sessions(sessions: &[VscodeChatSession]) -> String {
+    if sessions.is_empty() {
+        return "未找到 VS Code Copilot Chat 会话。\n请先在 VS Code 中进行一些对话。".to_string();
+    }
+    let mut lines = vec![format!("💬 VS Code Copilot 历史（{}）", sessions.len())];
+    for (i, s) in sessions.iter().take(20).enumerate() {
+        let dt = fmt_elapsed(s.last_message_date);
+        lines.push(format!("{}. [{}] {}", i + 1, dt, s.title));
+    }
+    lines.push("".to_string());
+    lines.push("发送「chat 历史 <编号>」查看该会话的提问摘要。".to_string());
+    lines.push("发送「问: <问题>」直接向 Copilot 提问。".to_string());
+    lines.join("\n")
+}
+
+fn fmt_recent_messages(msgs: &[String]) -> String {
+    if msgs.is_empty() {
+        return "暂无最近消息记录。".to_string();
+    }
+    let recent: Vec<&String> = msgs.iter().rev().take(10).collect();
+    let mut lines = vec!["💬 最近 Copilot 对话（你的提问）:".to_string()];
+    for (i, m) in recent.iter().rev().enumerate() {
+        let preview = if m.chars().count() > 80 {
+            let cut: String = m.chars().take(80).collect();
+            format!("{cut}…")
+        } else {
+            m.to_string()
+        };
+        lines.push(format!("{}. {}", i + 1, preview));
+    }
+    lines.join("\n")
+}
+
+fn fmt_elapsed(ts_ms: u64) -> String {
+    let secs = ts_ms / 1000;
+    let now = now_secs();
+    let elapsed = now.saturating_sub(secs);
+    if elapsed < 86400 { "今天".to_string() }
+    else if elapsed < 172800 { "昨天".to_string() }
+    else { format!("{}天前", elapsed / 86400) }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{auto_plan_from_request, infer_action_intent_candle, Intent};
+    use super::{auto_plan_from_request, infer_action_intent_candle, parse_intent, Intent};
 
     #[test]
     fn candle_fallback_infers_read() {
@@ -872,5 +1371,21 @@ mod tests {
     fn auto_plan_returns_none_for_short_chat() {
         let plan = auto_plan_from_request("你好");
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn parse_session_list_intent() {
+        match parse_intent("会话列表") {
+            Some(Intent::SessionList) => {}
+            _ => panic!("expected session list intent"),
+        }
+    }
+
+    #[test]
+    fn parse_session_load_intent() {
+        match parse_intent("载入会话 1774430905-trip") {
+            Some(Intent::SessionLoad(id)) => assert_eq!(id, "1774430905-trip"),
+            _ => panic!("expected session load intent"),
+        }
     }
 }

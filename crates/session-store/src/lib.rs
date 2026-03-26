@@ -9,6 +9,15 @@ use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSnapshotMeta {
+    pub id: String,
+    pub label: Option<String>,
+    pub updated_at: u64,
+    pub current_task: Option<String>,
+    pub pending_steps: usize,
+}
+
 // ---- SessionMode -------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,12 +73,8 @@ impl SessionStore {
         }
     }
 
-    /// Build a sandboxed path for the given user_id.
-    /// Replaces any character that is not alphanumeric, `-`, or `_` with `_`
-    /// so the file stays inside `base_dir` regardless of what the id contains.
-    fn path_for(&self, user_id: &str) -> PathBuf {
-        let safe: String = user_id
-            .chars()
+    fn sanitize_key(key: &str) -> String {
+        key.chars()
             .map(|c| {
                 if c.is_alphanumeric() || c == '-' || c == '_' {
                     c
@@ -77,8 +82,20 @@ impl SessionStore {
                     '_'
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    /// Build a sandboxed path for the given user_id.
+    /// Replaces any character that is not alphanumeric, `-`, or `_` with `_`
+    /// so the file stays inside `base_dir` regardless of what the id contains.
+    fn path_for(&self, user_id: &str) -> PathBuf {
+        let safe = Self::sanitize_key(user_id);
         self.base_dir.join(format!("{safe}.json"))
+    }
+
+    fn history_dir_for(&self, user_id: &str) -> PathBuf {
+        let safe = Self::sanitize_key(user_id);
+        self.base_dir.join("_history").join(safe)
     }
 
     /// Load session for `user_id`, returning a blank session on any error.
@@ -108,6 +125,83 @@ impl SessionStore {
     pub fn clear(&self, user_id: &str) {
         let path = self.path_for(user_id);
         let _ = fs::remove_file(path);
+    }
+
+    /// Save a snapshot of the current session for later restore.
+    pub fn save_snapshot(
+        &self,
+        session: &UserSession,
+        label: Option<&str>,
+    ) -> Result<String, SessionError> {
+        let history_dir = self.history_dir_for(&session.user_id);
+        fs::create_dir_all(&history_dir)?;
+
+        let ts = now_secs();
+        let label_slug = label
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+
+        let id = if label_slug.is_empty() {
+            format!("{ts}")
+        } else {
+            format!("{ts}-{label_slug}")
+        };
+
+        let path = history_dir.join(format!("{id}.json"));
+        let data = serde_json::to_string_pretty(session)?;
+        fs::write(path, data)?;
+        Ok(id)
+    }
+
+    /// List snapshots for a user, newest first.
+    pub fn list_snapshots(&self, user_id: &str) -> Result<Vec<SessionSnapshotMeta>, SessionError> {
+        let history_dir = self.history_dir_for(user_id);
+        if !history_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for entry in fs::read_dir(history_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let raw = fs::read_to_string(&path)?;
+            let s: UserSession = serde_json::from_str(&raw)?;
+
+            let label = id.split_once('-').map(|(_, rest)| rest.to_string());
+            out.push(SessionSnapshotMeta {
+                id,
+                label,
+                updated_at: s.updated_at,
+                current_task: s.current_task,
+                pending_steps: s.pending_steps.len(),
+            });
+        }
+
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        Ok(out)
+    }
+
+    /// Load a specific snapshot and bind it to the current user id.
+    pub fn load_snapshot(&self, user_id: &str, snapshot_id: &str) -> Result<UserSession, SessionError> {
+        let history_dir = self.history_dir_for(user_id);
+        let path = history_dir.join(format!("{}.json", Self::sanitize_key(snapshot_id)));
+        let raw = fs::read_to_string(path)?;
+        let mut s: UserSession = serde_json::from_str(&raw)?;
+        s.user_id = user_id.to_string();
+        Ok(s)
     }
 }
 

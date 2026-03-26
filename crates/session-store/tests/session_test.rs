@@ -95,3 +95,28 @@ fn pending_steps_ordering() {
     let reloaded = store.load("u3");
     assert_eq!(reloaded.pending_steps[0], "second");
 }
+
+#[test]
+fn snapshot_save_list_load_roundtrip() {
+    let (_tmp, store) = setup();
+    let session = UserSession {
+        user_id: "traveler".into(),
+        mode: SessionMode::Planning,
+        current_task: Some("remote-work".into()),
+        pending_steps: vec!["step1".into(), "step2".into()],
+        last_result: Some("ok".into()),
+        last_action: Some("plan".into()),
+        updated_at: now_secs(),
+    };
+
+    let id = store.save_snapshot(&session, Some("trip")).unwrap();
+    assert!(id.contains("trip"));
+
+    let list = store.list_snapshots("traveler").unwrap();
+    assert!(!list.is_empty());
+    assert_eq!(list[0].current_task.as_deref(), Some("remote-work"));
+
+    let loaded = store.load_snapshot("traveler", &id).unwrap();
+    assert_eq!(loaded.user_id, "traveler");
+    assert_eq!(loaded.pending_steps.len(), 2);
+}
