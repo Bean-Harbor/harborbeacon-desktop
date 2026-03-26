@@ -53,6 +53,9 @@ pub struct InboundMessage {
     pub chat_id: String,
     #[serde(default)]
     pub mentions: Vec<String>,
+    /// Message ID of the message this is replying to (if any).
+    #[serde(default)]
+    pub parent_id: String,
 }
 
 /// A message to send back to an IM channel.

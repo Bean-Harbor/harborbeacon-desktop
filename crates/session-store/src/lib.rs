@@ -46,6 +46,8 @@ pub struct UserSession {
     pub last_result: Option<String>,
     /// Raw text of the last action so "重试" can re-dispatch it.
     pub last_action: Option<String>,
+    /// Pending high-risk terminal command awaiting explicit confirmation.
+    pub pending_terminal_command: Option<String>,
     /// Unix timestamp (seconds) of last update.
     pub updated_at: u64,
 }

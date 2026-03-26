@@ -386,6 +386,12 @@ fn parse_event_json(raw: &str) -> Option<InboundMessage> {
         })
         .unwrap_or_default();
 
+    let parent_id = message
+        .get("parent_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
     Some(InboundMessage {
         channel: Channel::Feishu,
         sender_id: sender,
@@ -394,6 +400,7 @@ fn parse_event_json(raw: &str) -> Option<InboundMessage> {
         chat_type,
         chat_id,
         mentions,
+        parent_id,
     })
 }
 

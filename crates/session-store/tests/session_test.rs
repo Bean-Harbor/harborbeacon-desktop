@@ -29,6 +29,7 @@ fn save_and_reload() {
         pending_steps: vec!["step a".into(), "step b".into()],
         last_result: Some("ok".into()),
         last_action: Some("test".into()),
+        pending_terminal_command: None,
         updated_at: now_secs(),
     };
     store.save(&session).unwrap();
@@ -106,6 +107,7 @@ fn snapshot_save_list_load_roundtrip() {
         pending_steps: vec!["step1".into(), "step2".into()],
         last_result: Some("ok".into()),
         last_action: Some("plan".into()),
+        pending_terminal_command: None,
         updated_at: now_secs(),
     };
 

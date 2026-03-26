@@ -29,8 +29,20 @@ enum Intent {
     Diff(String),
     Patch(String),
     Test(String),
+    // dev-loop intents (edit/build/restart from Feishu)
+    WriteFile { path: String, content: String },
+    ReplaceInFile { path: String, old_text: String, new_text: String },
+    Build,
+    SelfRestart,
+    ViewLogs,
+    TerminalRun(String),
+    TerminalConfirm,
+    TerminalCancel,
+    GitCommit(String),
+    GitPush,
     // meta intents
     Continue,
+    ContinueAll,
     Retry,
     Status,
     SetPlan { description: String, steps: Vec<String> },
@@ -42,8 +54,30 @@ enum Intent {
     CopilotAsk(String),
     CopilotSessions,
     CopilotHistory(usize),
+    AgentFix(String),
+    SystemInstallHelp(String),
     Clear,
     Help,
+}
+
+/// Context passed through dispatch for build/restart operations.
+struct AgentContext {
+    desktop_root: String,
+    app_id: String,
+    app_secret: String,
+    domain: String,
+    workspace: String,
+}
+
+/// Dispatch result; if `restart` is Some, the main loop spawns the new binary and exits.
+struct DispatchOutcome {
+    reply: String,
+    restart: Option<RestartInfo>,
+}
+
+struct RestartInfo {
+    exe_path: String,
+    args: Vec<String>,
 }
 
 #[derive(Parser)]
@@ -83,6 +117,17 @@ async fn main() {
             .expect("failed to create reply client"),
     );
 
+    let agent_ctx = AgentContext {
+        desktop_root: std::path::Path::new(&cli.workspace)
+            .join("harborbeacon-desktop")
+            .to_string_lossy()
+            .to_string(),
+        app_id: cli.app_id.clone(),
+        app_secret: cli.app_secret.clone(),
+        domain: cli.domain.clone(),
+        workspace: cli.workspace.clone(),
+    };
+
     info!(workspace = %cli.workspace, session_dir = %session_dir, "Starting HarborBeacon Desktop Agent");
 
     let http = HttpClient::new();
@@ -99,18 +144,28 @@ async fn main() {
 
     while let Some(msg) = handle.message_rx.recv().await {
         info!(sender = %msg.sender_id, text = %msg.text, "Received message");
-        let reply_text = dispatch_with_session(&bridge, &store, &msg, &http, cli.github_token.as_deref()).await;
-        info!(reply = %reply_text, "Action result");
+        let outcome = dispatch_with_session(&bridge, &store, &msg, &http, cli.github_token.as_deref(), &agent_ctx).await;
+        info!(reply = %outcome.reply, "Action result");
 
         if !msg.message_id.is_empty() {
             let client = Arc::clone(&reply_client);
             let mid = msg.message_id.clone();
-            let rt = reply_text.clone();
-            tokio::spawn(async move {
-                if let Err(e) = client.reply_text(&mid, &rt).await {
-                    warn!(error = %e, "Failed to send Feishu reply");
-                }
-            });
+            let rt = outcome.reply.clone();
+            // Await reply delivery before potential restart.
+            let _ = client.reply_text(&mid, &rt).await;
+        }
+
+        // If a restart was requested, spawn the new binary and exit.
+        if let Some(restart) = outcome.restart {
+            info!(exe = %restart.exe_path, "Spawning new process and exiting for restart");
+            match std::process::Command::new(&restart.exe_path)
+                .args(&restart.args)
+                .spawn()
+            {
+                Ok(child) => info!(pid = child.id(), "New process spawned"),
+                Err(e) => error!(error = %e, "Failed to spawn new process"),
+            }
+            std::process::exit(0);
         }
     }
 
@@ -119,9 +174,10 @@ async fn main() {
 
 // ---- session-aware dispatch -------------------------------------------- 
 
-async fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg: &InboundMessage, http: &HttpClient, github_token: Option<&str>) -> String {
+async fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg: &InboundMessage, http: &HttpClient, github_token: Option<&str>, ctx: &AgentContext) -> DispatchOutcome {
     let text = msg.text.trim();
     let mut session = store.load(&msg.sender_id);
+    let mut restart_info: Option<RestartInfo> = None;
 
     let reply = match parse_intent(text) {
         None => help_text(),
@@ -144,9 +200,36 @@ async fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg
                         if rem == 0 {
                             "✅ 所有步骤已执行完毕".to_string()
                         } else {
-                            format!("还剩 {rem} 步，发送「继续」执行下一步")
+                            format!("还剩 {rem} 步，发送「继续」或「执行全部」")
                         }
                     )
+                }
+            }
+            Intent::ContinueAll => {
+                if session.pending_steps.is_empty() {
+                    "无待执行步骤。\n发送 `plan <任务>` 设置计划，或直接执行命令。".to_string()
+                } else {
+                    let mut outputs = Vec::new();
+                    while !session.pending_steps.is_empty() {
+                        let step = session.pending_steps.remove(0);
+                        let result = execute_plan_step(bridge, &step);
+                        session.last_result = Some(result.clone());
+                        outputs.push(format!("▸ 执行步骤: {step}\n{result}"));
+                        // Stop early if a step failed
+                        if result.contains('❌') {
+                            let rem = session.pending_steps.len();
+                            if rem > 0 {
+                                outputs.push(format!("\n⚠️ 步骤失败，已暂停。还剩 {rem} 步，发送「继续」或「执行全部」恢复。"));
+                            }
+                            break;
+                        }
+                    }
+                    session.updated_at = now_secs();
+                    if session.pending_steps.is_empty() {
+                        let _ = store.save_snapshot(&session, Some("auto-completed"));
+                        outputs.push("\n✅ 所有步骤已执行完毕".to_string());
+                    }
+                    outputs.join("\n\n")
                 }
             }
             Intent::Retry => match session.last_action.clone() {
@@ -202,9 +285,101 @@ async fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg
                     let _ = store.save_snapshot(&session, Some("auto-before-clear"));
                 }
                 store.clear(&msg.sender_id);
-                return "🗑 会话已清除（已自动归档）".to_string();
+                store.save(&session).ok();
+                return DispatchOutcome { reply: "🗑 会话已清除（已自动归档）".to_string(), restart: None };
             }
+            // ---------- dev-loop ----------
+            Intent::WriteFile { path, content } => {
+                match actions::write_file(bridge, &path, &content) {
+                    Ok(r) => format!("✅ {}", r.content),
+                    Err(e) => format!("❌ 写入失败: {e}"),
+                }
+            }
+            Intent::ReplaceInFile { path, old_text, new_text } => {
+                do_replace_in_file(bridge, &path, &old_text, &new_text)
+            }
+            Intent::Build => do_build(&ctx.desktop_root),
+            Intent::SelfRestart => {
+                match do_build_and_restart(ctx) {
+                    Ok((reply_msg, info)) => {
+                        restart_info = Some(info);
+                        reply_msg
+                    }
+                    Err(e) => e,
+                }
+            }
+            Intent::ViewLogs => do_view_logs(&ctx.desktop_root),
+            Intent::TerminalRun(command) => {
+                if is_high_risk_terminal_command(&command) {
+                    session.pending_terminal_command = Some(command.clone());
+                    session.updated_at = now_secs();
+                    format!(
+                        "⚠️ 检测到高风险命令，需二次确认后执行:\n{}\n\n发送“确认执行”继续，或发送“取消执行”放弃。",
+                        command
+                    )
+                } else {
+                    let result = do_terminal_command(&ctx.workspace, &command);
+                    session.last_action = Some(format!("/terminal {command}"));
+                    session.last_result = Some(result.clone());
+                    session.updated_at = now_secs();
+                    result
+                }
+            }
+            Intent::TerminalConfirm => {
+                match session.pending_terminal_command.clone() {
+                    Some(command) => {
+                        session.pending_terminal_command = None;
+                        let result = do_terminal_command(&ctx.workspace, &command);
+                        session.last_action = Some(format!("/terminal {command}"));
+                        session.last_result = Some(result.clone());
+                        session.updated_at = now_secs();
+                        result
+                    }
+                    None => "当前没有待确认的高风险终端命令。".to_string(),
+                }
+            }
+            Intent::TerminalCancel => {
+                if session.pending_terminal_command.take().is_some() {
+                    session.updated_at = now_secs();
+                    "✅ 已取消待确认的高风险终端命令。".to_string()
+                } else {
+                    "当前没有待确认的高风险终端命令。".to_string()
+                }
+            }
+            Intent::GitCommit(message) => do_git_commit(&ctx.workspace, &message),
+            Intent::GitPush => do_git_push(&ctx.workspace),
             // ---------- copilot bridge ----------
+            Intent::AgentFix(user_desc) => {
+                // Build context from session's last error/result + last action
+                let last_action = session.last_action.as_deref().unwrap_or("(unknown)");
+                let last_result = session.last_result.as_deref().unwrap_or("(no previous result)");
+                let desc_part = if user_desc.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nUser note: {user_desc}")
+                };
+                let prompt = format!(
+                    "The user ran a command/operation via Feishu remote agent and it failed. \
+                     Please analyze the error and suggest a concrete fix.\n\
+                     \n## Last command\n```\n{}\n```\n\
+                     \n## Error output\n```\n{}\n```{}\
+                     \n\nProvide a short analysis and the exact corrected command or code fix. \
+                     Reply in the user's language (Chinese).",
+                    last_action, last_result, desc_part
+                );
+                match copilot_ask(http, github_token, &prompt).await {
+                    Ok(ans) => format!("🔍 分析结果:\n\n{ans}"),
+                    Err(e) => {
+                        // Fallback: provide local analysis
+                        format!(
+                            "⚠️ Copilot 不可用 ({e})，以下是上次错误上下文:\n\
+                             命令: {last_action}\n\
+                             输出:\n{last_result}\n\n\
+                             提示: 检查命令拼写是否正确，或使用 /terminal <完整命令> 重试。"
+                        )
+                    }
+                }
+            }
             Intent::CopilotAsk(question) => match copilot_ask(http, github_token, &question).await {
                 Ok(ans) => ans,
                 Err(e) => format!("❌ Copilot 请求失败: {e}"),
@@ -225,6 +400,7 @@ async fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg
                     format!("未找到会话 #{n}，发送\"chat 历史\"查看完整列表。")
                 }
             }
+            Intent::SystemInstallHelp(task) => system_install_help_text(&task),
             Intent::Help => help_text(),
             // ---------- action ----------
             action => {
@@ -239,7 +415,7 @@ async fn dispatch_with_session(bridge: &BridgeBinding, store: &SessionStore, msg
     };
 
     store.save(&session).ok();
-    reply
+    DispatchOutcome { reply, restart: restart_info }
 }
 
 // ---- execute action intent -------------------------------------------- 
@@ -285,6 +461,14 @@ fn execute_action(bridge: &BridgeBinding, intent: Intent) -> String {
 fn execute_plan_step(bridge: &BridgeBinding, step: &str) -> String {
     if let Some(recipe_id) = step.strip_prefix("@recipe:") {
         return execute_recipe(bridge, recipe_id.trim());
+    }
+
+    // Handle /terminal steps directly in plans
+    if let Some(cmd) = step.strip_prefix("/terminal ") {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            return do_terminal_command(&bridge.workspace.path, cmd);
+        }
     }
 
     if let Some(action) = parse_action_intent(step) {
@@ -453,6 +637,18 @@ if __name__ == "__main__":
 
 // ---- intent parsing ----------------------------------------------------
 
+fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    if text.len() < prefix.len() {
+        return None;
+    }
+    let head = text.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        Some(&text[prefix.len()..])
+    } else {
+        None
+    }
+}
+
 fn parse_intent(text: &str) -> Option<Intent> {
     if text.is_empty() { return Some(Intent::Help); }
     let lower = text.to_lowercase();
@@ -460,6 +656,10 @@ fn parse_intent(text: &str) -> Option<Intent> {
     // meta: continue
     if matches!(lower.as_str(), "继续" | "continue" | "继续执行" | "下一步") {
         return Some(Intent::Continue);
+    }
+    // meta: continue all
+    if matches!(lower.as_str(), "执行全部" | "全部执行" | "run all" | "执行所有步骤" | "全部继续" | "一键执行") {
+        return Some(Intent::ContinueAll);
     }
     // meta: retry
     if matches!(lower.as_str(), "重试" | "retry" | "再试一次" | "再来一次") {
@@ -501,9 +701,48 @@ fn parse_intent(text: &str) -> Option<Intent> {
     if text == "/help" || matches!(lower.as_str(), "help" | "帮助") {
         return Some(Intent::Help);
     }
+    // meta: copilot-style /agent command
+    if let Some(rest) = strip_prefix_ci(text, "/agent") {
+        let arg_raw = rest.trim();
+        let arg = arg_raw.to_lowercase();
+        // /agent fix ... — debug and fix the last error
+        if arg == "fix" || arg.starts_with("fix ") || arg.starts_with("fix:") {
+            let desc = arg.strip_prefix("fix").unwrap_or("").trim_start_matches(':').trim().to_string();
+            return Some(Intent::AgentFix(desc));
+        }
+        return Some(match arg.as_str() {
+            "" | "status" => Intent::Status,
+            "coding" | "code" => Intent::SwitchMode(SessionMode::Coding),
+            "planning" | "plan" => Intent::SwitchMode(SessionMode::Planning),
+            "help" => Intent::Help,
+            _ => {
+                // Try to parse as a known command first
+                if let Some(intent) = parse_intent(arg_raw) {
+                    intent
+                } else {
+                    // Unknown task: send to Copilot for intelligent analysis
+                    Intent::CopilotAsk(format!(
+                        "用户通过飞书远程代理请求执行以下任务，工作区为本地 Rust 项目。\n\
+                         请给出可直接执行的具体步骤（优先用命令行）。\n\
+                         用户请求: {}",
+                        arg_raw
+                    ))
+                }
+            }
+        });
+    }
+    // standalone: fix / 修复 (without /agent prefix)
+    for prefix in &["/fix ", "/fix:", "fix ", "修复 "] {
+        if let Some(rest) = strip_prefix_ci(text, prefix) {
+            return Some(Intent::AgentFix(rest.trim().to_string()));
+        }
+    }
+    if matches!(lower.as_str(), "/fix" | "fix" | "修复" | "修复这个") {
+        return Some(Intent::AgentFix(String::new()));
+    }
     // meta: set plan (single-line prefix)
     for prefix in &["/plan ", "plan ", "计划 ", "规划 ", "/计划 ", "/规划 ", "做计划 ", "做规划 "] {
-        if let Some(rest) = text.strip_prefix(prefix) {
+        if let Some(rest) = strip_prefix_ci(text, prefix) {
             let (desc, steps) = parse_plan_body(rest);
             return Some(Intent::SetPlan { description: desc, steps });
         }
@@ -523,12 +762,72 @@ fn parse_intent(text: &str) -> Option<Intent> {
         return Some(Intent::Status);
     }
 
+    // ---- dev-loop commands ----
+    // build
+    if matches!(lower.as_str(), "build" | "/build" | "编译" | "构建") {
+        return Some(Intent::Build);
+    }
+    // restart
+    if matches!(lower.as_str(), "restart" | "/restart" | "重启" | "重启服务" | "rebuild" | "/rebuild") {
+        return Some(Intent::SelfRestart);
+    }
+    // logs
+    if matches!(lower.as_str(), "logs" | "/logs" | "日志" | "查看日志" | "最新日志" | "错误日志") {
+        return Some(Intent::ViewLogs);
+    }
+    // terminal
+    for prefix in &["/terminal ", "terminal "] {
+        if let Some(rest) = strip_prefix_ci(text, prefix) {
+            let cmd = rest.trim();
+            if !cmd.is_empty() {
+                return Some(Intent::TerminalRun(cmd.to_string()));
+            }
+        }
+    }
+    if matches!(lower.as_str(), "确认执行" | "confirm" | "/confirm" | "yes") {
+        return Some(Intent::TerminalConfirm);
+    }
+    if matches!(lower.as_str(), "取消执行" | "cancel" | "/cancel" | "no") {
+        return Some(Intent::TerminalCancel);
+    }
+    // git commit
+    for prefix in &["/commit ", "commit ", "提交 ", "git commit "] {
+        if let Some(rest) = strip_prefix_ci(text, prefix) {
+            let msg = rest.trim();
+            let msg = if msg.is_empty() { "feishu: auto-commit" } else { msg };
+            return Some(Intent::GitCommit(msg.to_string()));
+        }
+    }
+    // git push
+    if matches!(lower.as_str(), "push" | "/push" | "推送" | "git push") {
+        return Some(Intent::GitPush);
+    }
+    // write file: /write <path>\n<content>
+    if let Some(rest) = strip_prefix_ci(text, "/write ") {
+        if let Some(nl) = rest.find('\n') {
+            let path = rest[..nl].trim().to_string();
+            let content = rest[nl + 1..].to_string();
+            return Some(Intent::WriteFile { path, content });
+        }
+    }
+    // replace in file: /replace <path>\n<<<\n<old>\n===\n<new>\n>>>
+    if let Some(rest) = strip_prefix_ci(text, "/replace ") {
+        if let Some(intent) = parse_replace_command(rest) {
+            return Some(intent);
+        }
+    }
+
     if let Some(action) = parse_action_intent(text) {
         return Some(action);
     }
     // Copilot Chat bridge
+    for prefix in &["/ask ", "ask "] {
+        if let Some(q) = strip_prefix_ci(text, prefix) {
+            return Some(Intent::CopilotAsk(q.trim().to_string()));
+        }
+    }
     for prefix in &["问:", "ai:", "copilot:", "问copilot:", "ask:"] {
-        if let Some(q) = text.strip_prefix(prefix) {
+        if let Some(q) = strip_prefix_ci(text, prefix) {
             return Some(Intent::CopilotAsk(q.trim().to_string()));
         }
     }
@@ -545,8 +844,81 @@ fn parse_intent(text: &str) -> Option<Intent> {
     if matches!(lower.as_str(), "最近对话" | "最近消息" | "recent chat" | "查看最近对话") {
         return Some(Intent::CopilotHistory(0));
     }
+    if looks_like_system_install_request(text) {
+        return Some(Intent::SystemInstallHelp(text.trim().to_string()));
+    }
+    // Recognize common actionable natural-language requests
+    if let Some(intent) = match_natural_task(&lower, text) {
+        return Some(intent);
+    }
     if let Some((description, steps)) = auto_plan_from_request(text) {
         return Some(Intent::SetPlan { description, steps });
+    }
+    None
+}
+
+fn looks_like_system_install_request(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let has_install = lower.contains("install")
+        || lower.contains("安装")
+        || lower.contains("setup")
+        || lower.contains("winget")
+        || lower.contains("choco");
+    let has_system_target = lower.contains("powershell")
+        || lower.contains("软件")
+        || lower.contains("系统")
+        || lower.contains("aka.ms/")
+        || lower.contains("http://")
+        || lower.contains("https://");
+    has_install && has_system_target
+}
+
+fn system_install_help_text(task: &str) -> String {
+    format!(
+        "⚠️ 当前飞书代理不支持直接执行系统级安装（为避免误操作，执行器仅开放工作区读写/搜索/diff/patch/test）。\n\n请求: {task}\n\n可选方案:\n1. 在电脑本机执行安装命令（推荐）\n   winget install --id Microsoft.PowerShell --source winget\n2. 安装后回到飞书发送“继续”，我会继续代码任务。\n\n如果你希望我远程触发系统安装，我可以下一步为你加“需确认后执行”的受控命令通道。"
+    )
+}
+
+/// Match common natural-language task requests to direct intents.
+fn match_natural_task(lower: &str, _text: &str) -> Option<Intent> {
+    // Git sync / push to remote
+    let is_git_sync = lower.contains("同步") && (lower.contains("github") || lower.contains("git") || lower.contains("远程") || lower.contains("代码"))
+        || (lower.contains("push") && (lower.contains("代码") || lower.contains("github") || lower.contains("code")))
+        || lower.contains("推到github") || lower.contains("推送代码") || lower.contains("上传代码");
+    if is_git_sync {
+        // The workspace has two git repos:
+        //   parent: HarborNAS-LocalAgent-Project-git (workspace root)
+        //   child:  harborbeacon-desktop/ (nested repo with actual code)
+        // We must commit+push in BOTH, child first.
+        return Some(Intent::SetPlan {
+            description: "同步代码到 GitHub（子仓库 + 父仓库）".to_string(),
+            steps: vec![
+                "/terminal Write-Host '=== harborbeacon-desktop (子仓库) ==='; git -C harborbeacon-desktop status".to_string(),
+                "/terminal git -C harborbeacon-desktop add -A".to_string(),
+                "/terminal git -C harborbeacon-desktop diff --cached --quiet; if ($LASTEXITCODE -ne 0) { git -C harborbeacon-desktop commit -m 'sync: update from feishu agent' } else { Write-Host 'harborbeacon-desktop: nothing to commit' }".to_string(),
+                "/terminal git -C harborbeacon-desktop push".to_string(),
+                "/terminal Write-Host '=== parent repo ==='; git status".to_string(),
+                "/terminal git add -A; git diff --cached --quiet; if ($LASTEXITCODE -ne 0) { git commit -m 'chore: update desktop submodule pointer' } else { Write-Host 'parent: nothing to commit' }".to_string(),
+                "/terminal git push".to_string(),
+            ],
+        });
+    }
+    // Build project
+    let is_build = (lower.contains("编译") || lower.contains("构建") || lower.contains("build"))
+        && (lower.contains("项目") || lower.contains("代码") || lower.contains("agent") || lower.contains("project"));
+    if is_build {
+        return Some(Intent::Build);
+    }
+    // Run tests
+    let is_test = (lower.contains("测试") || lower.contains("test") || lower.contains("跑测试"))
+        && !lower.contains("写");
+    if is_test {
+        return Some(Intent::Test(String::new()));
+    }
+    // Check git diff/changes
+    let is_diff = lower.contains("查看变更") || lower.contains("看看改了什么") || lower.contains("有什么改动");
+    if is_diff {
+        return Some(Intent::Diff(String::new()));
     }
     None
 }
@@ -576,14 +948,9 @@ fn auto_plan_from_request(text: &str) -> Option<(String, Vec<String>)> {
         ));
     }
 
-    Some((
-        trimmed.to_string(),
-        vec![
-            "列出目录 .".to_string(),
-            format!("搜索 {trimmed}"),
-            "查看变更".to_string(),
-        ],
-    ))
+    // For unrecognized natural-language tasks, don't create a useless generic plan.
+    // Instead, return None and let it fall through to CopilotAsk in the /agent handler.
+    None
 }
 
 /// Action-only parser; also used by Continue to auto-execute plan steps.
@@ -880,6 +1247,276 @@ fn strip_list_prefix(s: &str) -> Option<&str> {
     None
 }
 
+// ---- dev-loop helper functions -----------------------------------------
+
+fn parse_replace_command(rest: &str) -> Option<Intent> {
+    // Format: path\n<<<\nold text\n===\nnew text\n>>>
+    let nl = rest.find('\n')?;
+    let path = rest[..nl].trim().to_string();
+    let body = &rest[nl + 1..];
+    let body = body.strip_prefix("<<<").unwrap_or(body).trim_start_matches('\n');
+    let parts: Vec<&str> = body.splitn(2, "\n===\n").collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let old_text = parts[0].to_string();
+    let new_text = parts[1].strip_suffix("\n>>>").unwrap_or(parts[1]).to_string();
+    Some(Intent::ReplaceInFile { path, old_text, new_text })
+}
+
+fn do_replace_in_file(bridge: &BridgeBinding, path: &str, old_text: &str, new_text: &str) -> String {
+    let abs = match bridge.resolve(path) {
+        Ok(p) => p,
+        Err(e) => return format!("❌ 路径错误: {e}"),
+    };
+    let content = match fs::read_to_string(&abs) {
+        Ok(c) => c,
+        Err(e) => return format!("❌ 读取失败: {e}"),
+    };
+    let count = content.matches(old_text).count();
+    if count == 0 {
+        return format!("❌ 未找到匹配文本:\n{old_text}");
+    }
+    let updated = content.replacen(old_text, new_text, 1);
+    if let Err(e) = fs::write(&abs, &updated) {
+        return format!("❌ 写入失败: {e}");
+    }
+    format!("✅ 已替换 {path} 中 {count} 处匹配（已替换第1处）\n变更前 {} 字节 → 变更后 {} 字节", content.len(), updated.len())
+}
+
+fn next_target_dir(desktop_root: &str) -> String {
+    let root = std::path::Path::new(desktop_root);
+    let mut max_n = 0u32;
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(suffix) = name.strip_prefix("target_feishu_") {
+                if let Ok(n) = suffix.parse::<u32>() {
+                    max_n = max_n.max(n);
+                }
+            }
+        }
+    }
+    format!("target_feishu_{}", max_n + 1)
+}
+
+fn do_build(desktop_root: &str) -> String {
+    let target_dir = next_target_dir(desktop_root);
+    let output = std::process::Command::new("cargo")
+        .current_dir(desktop_root)
+        .args(["build", "--target-dir", &target_dir, "-p", "harborbeacon-desktop-app"])
+        .output();
+    match output {
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if o.status.success() {
+                format!("✅ 编译成功\ntarget: {target_dir}\n{}", last_n_lines(&stderr, 5))
+            } else {
+                format!("❌ 编译失败\n{}", last_n_lines(&stderr, 30))
+            }
+        }
+        Err(e) => format!("❌ 无法启动 cargo: {e}"),
+    }
+}
+
+fn do_build_and_restart(ctx: &AgentContext) -> Result<(String, RestartInfo), String> {
+    let target_dir = next_target_dir(&ctx.desktop_root);
+    let output = std::process::Command::new("cargo")
+        .current_dir(&ctx.desktop_root)
+        .args(["build", "--target-dir", &target_dir, "-p", "harborbeacon-desktop-app"])
+        .output()
+        .map_err(|e| format!("❌ 无法启动 cargo: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("❌ 编译失败，取消重启\n{}", last_n_lines(&stderr, 30)));
+    }
+
+    let exe_path = std::path::Path::new(&ctx.desktop_root)
+        .join(&target_dir)
+        .join("debug")
+        .join("harborbeacon-desktop-app.exe");
+    if !exe_path.exists() {
+        return Err(format!("❌ 编译产物不存在: {}", exe_path.display()));
+    }
+
+    let args = vec![
+        "--app-id".to_string(), ctx.app_id.clone(),
+        "--app-secret".to_string(), ctx.app_secret.clone(),
+        "--domain".to_string(), ctx.domain.clone(),
+        "--workspace".to_string(), ctx.workspace.clone(),
+    ];
+
+    let reply = format!(
+        "✅ 编译成功 ({})\n正在重启…飞书连接将短暂中断后自动恢复。",
+        target_dir
+    );
+    Ok((reply, RestartInfo {
+        exe_path: exe_path.to_string_lossy().to_string(),
+        args,
+    }))
+}
+
+fn do_view_logs(desktop_root: &str) -> String {
+    let log_dir = std::path::Path::new(desktop_root).join("runlogs");
+    if !log_dir.exists() {
+        return "日志目录不存在。".to_string();
+    }
+    // Find latest err.log and stdout log
+    let mut entries: Vec<_> = fs::read_dir(&log_dir)
+        .ok()
+        .map(|rd| rd.flatten().collect())
+        .unwrap_or_default();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.file_name()));
+
+    let mut result = String::new();
+    let mut found = 0;
+    for entry in &entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if (name.ends_with(".err.log") || name.ends_with(".log")) && name.starts_with("desktop-agent-") {
+            if let Ok(content) = fs::read_to_string(entry.path()) {
+                let tail = last_n_lines(&content, 20);
+                if !tail.trim().is_empty() {
+                    result.push_str(&format!("── {} ──\n{}\n", name, tail));
+                    found += 1;
+                }
+            }
+            if found >= 2 { break; }
+        }
+    }
+    if result.is_empty() {
+        "最新日志为空。".to_string()
+    } else {
+        result
+    }
+}
+
+fn do_git_commit(workspace: &str, message: &str) -> String {
+    // git add -A
+    let add = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["add", "-A"])
+        .output();
+    if let Ok(o) = &add {
+        if !o.status.success() {
+            return format!("❌ git add 失败: {}", String::from_utf8_lossy(&o.stderr));
+        }
+    }
+    // git commit
+    let commit = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["commit", "-m", message])
+        .output();
+    match commit {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            if o.status.success() {
+                format!("✅ 已提交\n{}", last_n_lines(&out, 5))
+            } else {
+                format!("⚠️ git commit:\n{}\n{}", out.trim(), err.trim())
+            }
+        }
+        Err(e) => format!("❌ 无法执行 git: {e}"),
+    }
+}
+
+fn do_terminal_command(workspace: &str, command: &str) -> String {
+    // Force UTF-8 output to avoid garbled Chinese characters on Windows
+    let wrapped = format!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; {command}"
+    );
+    let output = std::process::Command::new("powershell")
+        .current_dir(workspace)
+        .args(["-NoProfile", "-Command", &wrapped])
+        .output();
+
+    match output {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            let merged = if err.trim().is_empty() {
+                out.to_string()
+            } else if out.trim().is_empty() {
+                err.to_string()
+            } else {
+                format!("{out}\n{err}")
+            };
+            let tail = truncate_chars(&merged, 6000);
+            if o.status.success() {
+                format!("✅ /terminal 执行成功\n{}", tail.trim())
+            } else {
+                format!(
+                    "❌ /terminal 执行失败 (exit={})\n{}",
+                    o.status.code().unwrap_or(-1),
+                    tail.trim()
+                )
+            }
+        }
+        Err(e) => format!("❌ /terminal 无法启动 shell: {e}"),
+    }
+}
+
+fn is_high_risk_terminal_command(command: &str) -> bool {
+    let c = command.to_lowercase();
+    let risk_tokens = [
+        "rm ",
+        "rm -",
+        "del ",
+        "erase ",
+        "rmdir ",
+        "format ",
+        "mkfs",
+        "shutdown",
+        "reboot",
+        "stop-process",
+        "taskkill",
+        "sc delete",
+        "reg delete",
+        "git reset --hard",
+        "git clean -fd",
+        "remove-item",
+    ];
+    risk_tokens.iter().any(|token| c.contains(token))
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for ch in s.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out.push_str("\n...(output truncated)");
+    out
+}
+
+fn do_git_push(workspace: &str) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(workspace)
+        .args(["push"])
+        .output();
+    match output {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let err = String::from_utf8_lossy(&o.stderr);
+            if o.status.success() {
+                format!("✅ 已推送\n{}{}", out.trim(), err.trim())
+            } else {
+                format!("❌ git push 失败:\n{}", err.trim())
+            }
+        }
+        Err(e) => format!("❌ 无法执行 git: {e}"),
+    }
+}
+
+fn last_n_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
 // ---- session formatting ------------------------------------------------
 
 fn has_meaningful_session(session: &session_store::UserSession) -> bool {
@@ -887,6 +1524,7 @@ fn has_meaningful_session(session: &session_store::UserSession) -> bool {
         || !session.pending_steps.is_empty()
         || session.last_action.is_some()
         || session.last_result.is_some()
+    || session.pending_terminal_command.is_some()
 }
 
 fn fmt_snapshot_list(items: &[session_store::SessionSnapshotMeta]) -> String {
@@ -927,18 +1565,23 @@ fn fmt_session_status(session: &session_store::UserSession) -> String {
         format!("待执行步骤（{}步）:\n{}", session.pending_steps.len(), list.join("\n"))
     };
     let last = session.last_action.as_deref().unwrap_or("（无）");
-    format!("📋 状态\n模式: {mode_label}\n当前任务: {task}\n{steps_part}\n上次操作: {last}")
+    let pending_terminal = session
+        .pending_terminal_command
+        .as_deref()
+        .map(|s| format!("\n待确认终端命令: {s}"))
+        .unwrap_or_default();
+    format!("📋 状态\n模式: {mode_label}\n当前任务: {task}\n{steps_part}\n上次操作: {last}{pending_terminal}")
 }
 
 fn fmt_plan_saved(description: &str, steps: &[String]) -> String {
     if steps.is_empty() {
-        format!("✅ 计划已记录\n任务: {description}\n\n发送「继续」执行，或补充步骤。")
+        format!("✅ 计划已记录\n任务: {description}\n\n发送「继续」逐步执行，或「执行全部」一键执行。")
     } else {
         let list: Vec<String> = steps.iter().enumerate()
             .map(|(i, s)| format!("  {}. {s}", i + 1))
             .collect();
         format!(
-            "✅ 计划已记录（共 {} 步）\n任务: {description}\n\n{}\n\n发送「继续」开始执行。",
+            "✅ 计划已记录（共 {} 步）\n任务: {description}\n\n{}\n\n发送「继续」逐步执行，或「执行全部」一键执行。",
             steps.len(),
             list.join("\n")
         )
@@ -948,7 +1591,8 @@ fn fmt_plan_saved(description: &str, steps: &[String]) -> String {
 fn help_text() -> String {
     "HarborBeacon 可用命令如下:\n\
 \n【🤖 Copilot 对话】\n\
-问: <问题>           直接向 Copilot 提问\n\
+/ask <问题>         直接向 Copilot 提问\n\
+ask <问题>          等价于 /ask\n\
 chat 历史            查看 VS Code Copilot 会话\n\
 chat 历史 <n>        查看第 n 个会话的提问摘要\n\
 最近对话             查看最近 10 条提问\n\
@@ -959,17 +1603,35 @@ search <path> <q>    搜索文本\n\
 diff [path]          查看 git diff\n\
 /patch <patch>       应用补丁\n\
 test [filter]        运行测试\n\
-（也支持自然语言：如\"读取文件 README.md\"）\n\
+\n【🔧 飞书调试 (Dev-Loop)】\n\
+/replace <path>      替换文件内容（多行格式见下）\n\
+/write <path>        写入新文件（第二行起为内容）\n\
+/terminal <cmd>      在项目目录执行终端命令\n\
+/agent fix [描述]    分析上次错误并给出修复建议\n\
+fix [描述]           等价于 /agent fix\n\
+确认执行             执行待确认的高风险命令\n\
+取消执行             取消待确认的高风险命令\n\
+build | /build       编译 desktop agent\n\
+restart | /restart   编译并重启当前 agent\n\
+logs | /logs         查看最新运行日志\n\
+commit <msg>         git add -A && commit\n\
+push | /push         git push\n\
+\n  /replace 格式:\n\
+  /replace path/to/file\n\
+  <<<\n\
+  旧代码\n\
+  ===\n\
+  新代码\n\
+  >>>\n\
 \n【会话命令】\n\
-plan <任务>          记录任务（换行写步骤）\n\
+/plan <任务>         记录任务（换行写步骤）\n\
+/agent status        查看当前任务进展\n\
+/agent <任务>        交给助手解析与执行\n\
 继续                 执行下一步\n\
+执行全部              一键执行所有步骤\n\
 重试                 重新执行上次操作\n\
 状态                 查看当前任务进展\n\
-会话列表             查看历史会话\n\
-保存会话 [名称]      保存当前会话快照\n\
-载入会话 <id>        恢复历史会话并继续\n\
-清除                 清除会话（自动归档）\n\
-切换编码/切换规划     切换工作模式"
+清除                 清除会话（自动归档）"
         .to_string()
 }
 
@@ -1386,6 +2048,14 @@ mod tests {
         match parse_intent("载入会话 1774430905-trip") {
             Some(Intent::SessionLoad(id)) => assert_eq!(id, "1774430905-trip"),
             _ => panic!("expected session load intent"),
+        }
+    }
+
+    #[test]
+    fn parse_system_install_request_intent() {
+        match parse_intent("帮我 install powershell 6+: https://aka.ms/powershell") {
+            Some(Intent::SystemInstallHelp(_)) => {}
+            _ => panic!("expected system install help intent"),
         }
     }
 }

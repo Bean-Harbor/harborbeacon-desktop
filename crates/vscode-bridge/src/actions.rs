@@ -240,6 +240,19 @@ fn validate_patch_paths(patch: &str) -> Result<(), BridgeError> {
     Ok(())
 }
 
+/// Write (or overwrite) a file inside the workspace. Path must be relative.
+pub fn write_file(bridge: &BridgeBinding, rel_path: &str, content: &str) -> Result<ActionResult, BridgeError> {
+    let abs = bridge.resolve(rel_path)?;
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent).map_err(|e| BridgeError::Io(format!("mkdir failed: {e}")))?;
+    }
+    fs::write(&abs, content).map_err(|e| BridgeError::Io(format!("write failed: {e}")))?;
+    Ok(ActionResult {
+        success: true,
+        content: format!("Written {} bytes to {rel_path}", content.len()),
+    })
+}
+
 fn collect_files_inner(
     dir: &std::path::Path,
     depth: usize,
