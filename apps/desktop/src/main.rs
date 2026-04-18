@@ -887,7 +887,7 @@ fn match_natural_task(lower: &str, _text: &str) -> Option<Intent> {
         || lower.contains("推到github") || lower.contains("推送代码") || lower.contains("上传代码");
     if is_git_sync {
         // The workspace has two git repos:
-        //   parent: HarborNAS-LocalAgent-Project-git (workspace root)
+        //   parent: HarborBeacon-LocalAgent-Project-git (workspace root)
         //   child:  harborbeacon-desktop/ (nested repo with actual code)
         // We must commit+push in BOTH, child first.
         return Some(Intent::SetPlan {
